@@ -1,377 +1,1167 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.spatial import distance, Voronoi
-import folium
-from folium.plugins import HeatMap, MarkerCluster
-import webbrowser
-import os
-import random
-from matplotlib.patches import Polygon
-from matplotlib.collections import PatchCollection
-from matplotlib.path import Path
-import matplotlib.cm as cm
-
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
-
-
-# ==================== 数据准备 ====================
-def generate_data(n_cities=50, seed=42):
-    np.random.seed(seed)
-    random.seed(seed)
-
-    data = {
-        '城市序号': range(1, n_cities + 1),
-        'x坐标': np.random.randint(0, 100, n_cities),
-        'y坐标': np.random.randint(0, 100, n_cities),
-        '供需量': np.random.randint(10, 100, n_cities),
-        '仓库成本': np.random.randint(50000, 200000, n_cities),
-        '物流系数': np.round(np.random.uniform(0.8, 1.5, n_cities), 2)
-    }
-    return pd.DataFrame(data)
-
-
-# ==================== 蚁群优化算法 ====================
-class EnhancedACO:
-    def __init__(self, dist_matrix, demands, warehouse_costs, logistics_factors,
-                 n_centers=5, n_ants=20, max_iter=100,
-                 alpha=1, beta=2, rho=0.1, q0=0.7):
-        self.dist_matrix = dist_matrix
-        self.demands = demands
-        self.warehouse_costs = warehouse_costs
-        self.logistics_factors = logistics_factors
-        self.n_nodes = len(dist_matrix)
-        self.n_centers = n_centers
-        self.n_ants = n_ants
-        self.max_iter = max_iter
-        self.alpha = alpha  # 信息素重要程度
-        self.beta = beta  # 启发式信息重要程度
-        self.rho = rho  # 信息素挥发系数
-        self.q0 = q0  # 直接选择概率
-
-        # 初始化信息素矩阵
-        self.pheromone = np.ones((self.n_nodes, self.n_nodes)) / self.n_nodes
-        self.best_solution = None
-        self.best_cost = float('inf')
-
-    def _calculate_cost(self, solution):
-        if len(solution) != self.n_centers:
-            return float('inf')
-
-        nearest_centers = np.argmin(self.dist_matrix[:, solution], axis=1)
-        total_cost = 0
-
-        for idx, center in enumerate(solution):
-            served_nodes = np.where(nearest_centers == idx)[0]
-            if len(served_nodes) == 0:
-                return float('inf')
-
-            transport_cost = np.sum(
-                self.demands[served_nodes] *
-                np.min(self.dist_matrix[:, solution], axis=1)[served_nodes] *
-                self.logistics_factors[center]
-            )
-            total_cost += transport_cost + self.warehouse_costs[center]
-
-        return total_cost
-
-    def run(self):
-        convergence_curve = []
-
-        for iteration in range(self.max_iter):
-            solutions = []
-            costs = []
-
-            for ant in range(self.n_ants):
-                # 构建解
-                allowed = list(range(self.n_nodes))
-                solution = []
-
-                while len(solution) < self.n_centers and len(allowed) > 0:
-                    if len(solution) == 0:
-                        # 初始随机选择
-                        next_node = random.choice(allowed)
-                    else:
-                        # 计算转移概率
-                        tau = self.pheromone[solution[-1], allowed] ** self.alpha
-                        eta = (1 / (self.dist_matrix[solution[-1], allowed] + 1e-10)) ** self.beta
-                        prob = tau * eta
-                        prob /= prob.sum()
-
-                        # 轮盘赌或直接选择
-                        if random.random() < self.q0:
-                            next_node = allowed[np.argmax(prob)]
-                        else:
-                            next_node = np.random.choice(allowed, p=prob)
-
-                    solution.append(next_node)
-                    allowed.remove(next_node)
-
-                # 评估解
-                cost = self._calculate_cost(solution)
-                solutions.append(solution)
-                costs.append(cost)
-
-                # 更新最优解
-                if cost < self.best_cost:
-                    self.best_solution = solution.copy()
-                    self.best_cost = cost
-
-            # 更新信息素
-            self.pheromone *= (1 - self.rho)  # 信息素挥发
-
-            # 只允许最优蚂蚁释放信息素
-            best_idx = np.argmin(costs)
-            for i in range(len(solutions[best_idx]) - 1):
-                from_node = solutions[best_idx][i]
-                to_node = solutions[best_idx][i + 1]
-                self.pheromone[from_node, to_node] += 1.0 / costs[best_idx]
-
-            convergence_curve.append(self.best_cost)
-
-            # 打印进度
-            if (iteration + 1) % 10 == 0:
-                print(f"Iteration {iteration + 1}/{self.max_iter}, Best Cost: {self.best_cost:,.2f}")
-
-        return self.best_solution, self.best_cost, convergence_curve
-
-
-# ==================== 可视化函数 ====================
-def plot_convergence(convergence):
-    plt.figure(figsize=(10, 6))
-    plt.plot(convergence, 'b-', linewidth=2)
-    plt.xlabel('迭代次数')
-    plt.ylabel('总成本')
-    plt.title('蚁群算法收敛曲线')
-    plt.grid(True)
-    plt.show()
-
-
-def plot_location_map(df, result, dist_matrix):
-    plt.figure(figsize=(12, 8))
-
-    # 绘制所有城市
-    plt.scatter(df['x坐标'], df['y坐标'],
-                s=df['供需量'] / 2, c='blue',
-                alpha=0.6, label='需求点')
-
-    # 绘制配送中心
-    plt.scatter(result['x坐标'], result['y坐标'],
-                s=100, c='red', marker='s',
-                edgecolors='black', label='配送中心')
-
-    # 绘制服务区域（Voronoi图）
-    points = result[['x坐标', 'y坐标']].values
-    vor = Voronoi(points)
-
-    # 绘制Voronoi边
-    for simplex in vor.ridge_vertices:
-        simplex = np.asarray(simplex)
-        if np.all(simplex >= 0):
-            plt.plot(vor.vertices[simplex, 0],
-                     vor.vertices[simplex, 1], 'k--', alpha=0.4)
-
-    # 添加标签
-    for i, row in result.iterrows():
-        plt.annotate(f"#{row['城市序号']}\n成本:{row['服务总成本'] / 10000:.1f}万",
-                     (row['x坐标'], row['y坐标']),
-                     textcoords="offset points", xytext=(0, 10),
-                     ha='center', fontsize=8)
-
-    plt.xlabel('X坐标')
-    plt.ylabel('Y坐标')
-    plt.title('配送中心选址与服务区域划分')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
-def plot_radar_chart(result):
-    categories = [f"中心#{i}" for i in result['城市序号']]
-    labels = np.array(categories)
-
-    # 标准化数据
-    norm_cost = result['服务总成本'] / result['服务总成本'].max()
-    norm_demand = result['供需量'] / result['供需量'].max()
-    norm_coverage = result['服务城市数'] / result['服务城市数'].max()
-
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False)
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, polar=True)
-
-    # 绘制三条线
-    ax.plot(angles, norm_cost, 'o-', label='相对成本')
-    ax.plot(angles, norm_demand, 'o-', label='相对需求')
-    ax.plot(angles, norm_coverage, 'o-', label='相对覆盖')
-
-    ax.fill(angles, norm_cost, alpha=0.1)
-    ax.fill(angles, norm_demand, alpha=0.1)
-    ax.fill(angles, norm_coverage, alpha=0.1)
-
-    ax.set_thetagrids(angles * 180 / np.pi, labels)
-    ax.set_title('配送中心性能雷达图', pad=20)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
-    plt.show()
-
-
-def plot_cost_breakdown(result):
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    # 计算成本构成
-    transport_cost = result['服务总成本'] - result['仓库成本']
-
-    # 堆叠条形图
-    p1 = ax.bar(result['城市序号'], result['仓库成本'], label='仓库成本')
-    p2 = ax.bar(result['城市序号'], transport_cost, bottom=result['仓库成本'],
-                label='运输成本')
-
-    ax.set_xlabel('配送中心编号')
-    ax.set_ylabel('成本 (万元)')
-    ax.set_title('配送中心成本构成分析')
-    ax.legend()
-
-    # 修正后的标签添加逻辑
-    for rect in p1.patches + p2.patches:  # 使用.patches访问所有矩形
-        height = rect.get_height()
-        bottom = rect.get_y()
-        ax.text(rect.get_x() + rect.get_width() / 2., bottom + height / 2,
-                f'{height / 10000:.1f}万',
-                ha='center', va='center', fontsize=8)
-
-    plt.xticks(result['城市序号'])
-    plt.grid(axis='y', alpha=0.3)
-    plt.show()
-
-
-def plot_map_with_folium(df, result, dist_matrix):
-    # 计算中心点
-    center_lat, center_lon = df['y坐标'].mean() / 100, df['x坐标'].mean() / 100
-
-    # 创建地图（坐标缩放100倍模拟经纬度）
-    m = folium.Map(location=[center_lat, center_lon],
-                   zoom_start=11,
-                   tiles='https://webst02.is.autonavi.com/appmaptile?style=7&x={x}&y={y}&z={z}',
-                   attr='高德地图')
-
-    # 添加热力图（需求密度）
-    heat_data = [[row['y坐标'] / 100, row['x坐标'] / 100, row['供需量']]
-                 for _, row in df.iterrows()]
-    HeatMap(heat_data, radius=15, blur=10,
-            gradient={0.4: 'blue', 0.6: 'lime', 1: 'red'}).add_to(m)
-
-    # 添加需求点标记
-    mc = MarkerCluster()
-    for _, row in df.iterrows():
-        popup_text = f"""
-        <b>城市#{row['城市序号']}</b><br>
-        坐标: ({row['x坐标']}, {row['y坐标']})<br>
-        需求量: {row['供需量']}吨<br>
-        仓库成本: ¥{row['仓库成本']:,}
-        """
-        mc.add_child(
-            folium.CircleMarker(
-                location=[row['y坐标'] / 100, row['x坐标'] / 100],
-                radius=row['供需量'] / 10,
-                popup=popup_text,
-                color='#3186cc',
-                fill=True,
-                fill_opacity=0.7
-            )
-        )
-    m.add_child(mc)
-
-    # 添加配送中心标记
-    for _, row in result.iterrows():
-        # 计算服务区域
-        nearest_centers = np.argmin(dist_matrix[:, result.index], axis=1)
-        served_nodes = np.where(nearest_centers == np.where(np.array(result.index) == row.name)[0][0])[0]
-
-        folium.Marker(
-            location=[row['y坐标'] / 100, row['x坐标'] / 100],
-            popup=f"""
-            <b>配送中心#{row['城市序号']}</b><br>
-            服务城市: {len(served_nodes)}个<br>
-            总成本: ¥{row['服务总成本']:,}<br>
-            <button onclick="alert('服务城市: {df.iloc[served_nodes]['城市序号'].tolist()}')">
-            查看详情</button>
-            """,
-            icon=folium.Icon(
-                color='red',
-                icon='warehouse',
-                prefix='fa'
-            )
-        ).add_to(m)
-
-        # 绘制服务范围（泰森多边形）
-        points = [[p[1] / 100, p[0] / 100] for p in result[['x坐标', 'y坐标']].values]
-        vor = Voronoi(points)
-        lines = [
-            [(points[i][0], points[i][1]), (points[j][0], points[j][1])]
-            for i, j in vor.ridge_vertices if i >= 0 and j >= 0
-        ]
-        folium.PolyLine(
-            locations=lines,
-            color='orange',
-            weight=2,
-            opacity=0.6
-        ).add_to(m)
-
-    # 保存并自动打开地图
-    map_path = 'delivery_centers_map.html'
-    webbrowser.open('file://' + os.path.realpath(map_path))
-    return m
-
-
-# ==================== 主程序 ====================
-if __name__ == '__main__':
-    # 1. 生成模拟数据
-    df = generate_data(n_cities=50, seed=42)
-
-    # 2. 计算距离矩阵
-    coordinates = df[['x坐标', 'y坐标']].values
-    dist_matrix = distance.cdist(coordinates, coordinates, 'euclidean')
-
-    # 3. 运行优化算法
-    aco = EnhancedACO(
-        dist_matrix=dist_matrix,
-        demands=df['供需量'].values,
-        warehouse_costs=df['仓库成本'].values,
-        logistics_factors=df['物流系数'].values,
-        n_centers=6,
-        n_ants=50,
-        max_iter=200
-    )
-
-    best_solution, best_cost, convergence = aco.run()
-
-    # 4. 准备结果数据
-    result = df.iloc[best_solution].copy()
-    service_costs = []
-    service_counts = []
-
-    nearest_centers = np.argmin(dist_matrix[:, best_solution], axis=1)
-    for c in best_solution:
-        served_nodes = np.where(nearest_centers == np.where(np.array(best_solution) == c)[0][0])[0]
-        transport_cost = np.sum(
-            df['供需量'].values[served_nodes] *
-            np.min(dist_matrix[:, best_solution], axis=1)[served_nodes] *
-            df['物流系数'].values[c]
-        )
-        service_costs.append(transport_cost + df['仓库成本'].values[c])
-        service_counts.append(len(served_nodes))
-
-    result['服务总成本'] = service_costs
-    result['服务城市数'] = service_counts
-
-    # 5. 显示结果
-    print("\n最优配送中心选址方案：")
-    print(result[['城市序号', 'x坐标', 'y坐标', '供需量', '仓库成本', '物流系数', '服务总成本', '服务城市数']])
-    print(f"\n系统总成本: ¥{best_cost:,.2f}")
-
-    # 6. 执行所有可视化
-    plot_convergence(convergence)
-    plot_location_map(df, result, dist_matrix)
-    plot_radar_chart(result)
-    plot_cost_breakdown(result)
-    plot_map_with_folium(df, result, dist_matrix)
+
+<!DOCTYPE html>
+<html>
+<head>
+    
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
+    <link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.0/css/bootstrap-glyphicons.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.0/css/all.min.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/python-visualization/folium/folium/templates/leaflet.awesome.rotate.min.css"/>
+    
+            <meta name="viewport" content="width=device-width,
+                initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+            <style>
+                #map_35a6c8246d782babb2529a2712c6f230 {
+                    position: relative;
+                    width: 100.0%;
+                    height: 100.0%;
+                    left: 0.0%;
+                    top: 0.0%;
+                }
+                .leaflet-container { font-size: 1rem; }
+            </style>
+
+            <style>html, body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            </style>
+
+            <style>#map {
+                position:absolute;
+                top:0;
+                bottom:0;
+                right:0;
+                left:0;
+                }
+            </style>
+
+            <script>
+                L_NO_TOUCH = false;
+                L_DISABLE_3D = false;
+            </script>
+
+        
+    <script src="https://cdn.jsdelivr.net/gh/python-visualization/folium@main/folium/templates/leaflet_heat.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.1.0/leaflet.markercluster.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.1.0/MarkerCluster.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.1.0/MarkerCluster.Default.css"/>
+</head>
+<body>
+    
+    
+            <div class="folium-map" id="map_35a6c8246d782babb2529a2712c6f230" ></div>
+        
+</body>
+<script>
+    
+    
+            var map_35a6c8246d782babb2529a2712c6f230 = L.map(
+                "map_35a6c8246d782babb2529a2712c6f230",
+                {
+                    center: [35.0, 105.0],
+                    crs: L.CRS.EPSG3857,
+                    ...{
+  "zoom": 5,
+  "zoomControl": true,
+  "preferCanvas": false,
+}
+
+                }
+            );
+
+            
+
+        
+    
+            var tile_layer_cbcb80dbd60da57c0c0d20140c92ee9c = L.tileLayer(
+                "https://webst02.is.autonavi.com/appmaptile?style=7\u0026x={x}\u0026y={y}\u0026z={z}",
+                {
+  "minZoom": 0,
+  "maxZoom": 18,
+  "maxNativeZoom": 18,
+  "noWrap": false,
+  "attribution": "\u9ad8\u5fb7\u5730\u56fe",
+  "subdomains": "abc",
+  "detectRetina": false,
+  "tms": false,
+  "opacity": 1,
+}
+
+            );
+        
+    
+            tile_layer_cbcb80dbd60da57c0c0d20140c92ee9c.addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var heat_map_d4235ed423589c6c946658c48bcde1f4 = L.heatLayer(
+                [[39.9, 116.4, 15743], [31.23, 121.47, 16934], [23.12, 113.26, 10572], [22.55, 114.05, 11849], [30.67, 104.06, 7800], [29.53, 106.5, 11862], [30.28, 120.15, 7158], [30.6, 114.3, 6986], [34.27, 108.93, 4761], [31.32, 120.62, 8713], [39.13, 117.2, 6465], [32.04, 118.78, 6437], [28.2, 112.97, 5346], [34.75, 113.62, 5422], [23.05, 113.75, 4367], [36.07, 120.38, 5529], [41.8, 123.43, 3128], [29.88, 121.55, 5306], [25.05, 102.73, 3104], [31.83, 117.25, 4509], [26.08, 119.3, 4476], [38.05, 114.52, 3013], [45.75, 126.63, 2674], [43.9, 125.32, 3167], [28.68, 115.85, 2673], [26.65, 106.63, 2023], [37.87, 112.55, 1878], [22.82, 108.37, 2330], [36.07, 103.82, 1382], [20.03, 110.32, 856], [38.47, 106.28, 896], [36.62, 101.78, 762], [40.83, 111.73, 1308], [29.65, 91.13, 288], [43.82, 87.62, 1575]],
+                {
+  "minOpacity": 0.5,
+  "maxZoom": 18,
+  "radius": 15,
+  "blur": 10,
+  "gradient": {
+  0.4: "blue",
+  0.6: "lime",
+  1: "red",
+},
+}
+            );
+        
+    
+            heat_map_d4235ed423589c6c946658c48bcde1f4.addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var marker_cluster_47479cfd93c02bee189abcc4acd679f0 = L.markerClusterGroup(
+                {
+}
+            );
+        
+    
+            var circle_marker_19cdc593e4c9dd297e1f5c10f3275513 = L.circleMarker(
+                [39.9, 116.4],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 314.86, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_e6eaccd59dddc219d16d41217c9d2058 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_57a9f62a3bbbd6bc23a35bcbd7cc4555 = $(`<div id="html_57a9f62a3bbbd6bc23a35bcbd7cc4555" style="width: 100.0%; height: 100.0%;">         <b>北京</b><br>         人口: 1574万人<br>         需求量: 15743吨<br>         仓库成本: ¥5,085,567.0         </div>`)[0];
+                popup_e6eaccd59dddc219d16d41217c9d2058.setContent(html_57a9f62a3bbbd6bc23a35bcbd7cc4555);
+            
+        
+
+        circle_marker_19cdc593e4c9dd297e1f5c10f3275513.bindPopup(popup_e6eaccd59dddc219d16d41217c9d2058)
+        ;
+
+        
+    
+    
+            var circle_marker_8edfe67e9ef8b0bdea61b223e7bd9bcf = L.circleMarker(
+                [31.23, 121.47],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 338.68, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_4acfb90008bc240bdf1f83d3b093bd59 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_fb9ac15f01e858849678c3f82ac34f66 = $(`<div id="html_fb9ac15f01e858849678c3f82ac34f66" style="width: 100.0%; height: 100.0%;">         <b>上海</b><br>         人口: 1693万人<br>         需求量: 16934吨<br>         仓库成本: ¥5,090,308.0         </div>`)[0];
+                popup_4acfb90008bc240bdf1f83d3b093bd59.setContent(html_fb9ac15f01e858849678c3f82ac34f66);
+            
+        
+
+        circle_marker_8edfe67e9ef8b0bdea61b223e7bd9bcf.bindPopup(popup_4acfb90008bc240bdf1f83d3b093bd59)
+        ;
+
+        
+    
+    
+            var circle_marker_da43cb4059b175ba13324847063047f5 = L.circleMarker(
+                [23.12, 113.26],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 211.44, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_96b8a9f64b7906f81788c41ce895bdd5 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_49f47ed0a4cf030e675dd5460af281d0 = $(`<div id="html_49f47ed0a4cf030e675dd5460af281d0" style="width: 100.0%; height: 100.0%;">         <b>广州</b><br>         人口: 1057万人<br>         需求量: 10572吨<br>         仓库成本: ¥5,072,482.0         </div>`)[0];
+                popup_96b8a9f64b7906f81788c41ce895bdd5.setContent(html_49f47ed0a4cf030e675dd5460af281d0);
+            
+        
+
+        circle_marker_da43cb4059b175ba13324847063047f5.bindPopup(popup_96b8a9f64b7906f81788c41ce895bdd5)
+        ;
+
+        
+    
+    
+            var circle_marker_a5ad8ebb489b37e2c17358ac68bd812f = L.circleMarker(
+                [22.55, 114.05],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 236.98, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_756aaf8b3e56b989422fac6da2554ffb = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_90f798d997d33f1a7c7b314f42f7714e = $(`<div id="html_90f798d997d33f1a7c7b314f42f7714e" style="width: 100.0%; height: 100.0%;">         <b>深圳</b><br>         人口: 1184万人<br>         需求量: 11849吨<br>         仓库成本: ¥5,099,045.0         </div>`)[0];
+                popup_756aaf8b3e56b989422fac6da2554ffb.setContent(html_90f798d997d33f1a7c7b314f42f7714e);
+            
+        
+
+        circle_marker_a5ad8ebb489b37e2c17358ac68bd812f.bindPopup(popup_756aaf8b3e56b989422fac6da2554ffb)
+        ;
+
+        
+    
+    
+            var circle_marker_c2dd20b20cf27379d282e3210a42216a = L.circleMarker(
+                [30.67, 104.06],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 156.0, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_aaabb43728c02c7b0c168d8112f203bb = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_c0f0b1d0daa49c75bb453216f3212af8 = $(`<div id="html_c0f0b1d0daa49c75bb453216f3212af8" style="width: 100.0%; height: 100.0%;">         <b>成都</b><br>         人口: 780万人<br>         需求量: 7800吨<br>         仓库成本: ¥3,658,420.0         </div>`)[0];
+                popup_aaabb43728c02c7b0c168d8112f203bb.setContent(html_c0f0b1d0daa49c75bb453216f3212af8);
+            
+        
+
+        circle_marker_c2dd20b20cf27379d282e3210a42216a.bindPopup(popup_aaabb43728c02c7b0c168d8112f203bb)
+        ;
+
+        
+    
+    
+            var circle_marker_bb0b807b448be9d1dd328d9f3971ec85 = L.circleMarker(
+                [29.53, 106.5],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 237.24, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_177f6cd40bc23f55b9f8e7233c803888 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_aed0ec61a157779d7c4cecf5e7b41ff4 = $(`<div id="html_aed0ec61a157779d7c4cecf5e7b41ff4" style="width: 100.0%; height: 100.0%;">         <b>重庆</b><br>         人口: 1186万人<br>         需求量: 11862吨<br>         仓库成本: ¥3,657,052.0         </div>`)[0];
+                popup_177f6cd40bc23f55b9f8e7233c803888.setContent(html_aed0ec61a157779d7c4cecf5e7b41ff4);
+            
+        
+
+        circle_marker_bb0b807b448be9d1dd328d9f3971ec85.bindPopup(popup_177f6cd40bc23f55b9f8e7233c803888)
+        ;
+
+        
+    
+    
+            var circle_marker_0b91feb276852df23379de57755713bf = L.circleMarker(
+                [30.28, 120.15],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 143.16, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_cd8f2ccaa1630b0c3d0b97caf2f882b2 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_31fdaf357649aa082c499ef44998479b = $(`<div id="html_31fdaf357649aa082c499ef44998479b" style="width: 100.0%; height: 100.0%;">         <b>杭州</b><br>         人口: 715万人<br>         需求量: 7158吨<br>         仓库成本: ¥3,676,130.0         </div>`)[0];
+                popup_cd8f2ccaa1630b0c3d0b97caf2f882b2.setContent(html_31fdaf357649aa082c499ef44998479b);
+            
+        
+
+        circle_marker_0b91feb276852df23379de57755713bf.bindPopup(popup_cd8f2ccaa1630b0c3d0b97caf2f882b2)
+        ;
+
+        
+    
+    
+            var circle_marker_6a50fe46c123f78b111b957f5b9eb10e = L.circleMarker(
+                [30.6, 114.3],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 139.72, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_d218b040ccf54ed4c40f15bba8dc8404 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_c8975da76947e2bf11384c1cc97cbf9c = $(`<div id="html_c8975da76947e2bf11384c1cc97cbf9c" style="width: 100.0%; height: 100.0%;">         <b>武汉</b><br>         人口: 698万人<br>         需求量: 6986吨<br>         仓库成本: ¥3,648,155.0         </div>`)[0];
+                popup_d218b040ccf54ed4c40f15bba8dc8404.setContent(html_c8975da76947e2bf11384c1cc97cbf9c);
+            
+        
+
+        circle_marker_6a50fe46c123f78b111b957f5b9eb10e.bindPopup(popup_d218b040ccf54ed4c40f15bba8dc8404)
+        ;
+
+        
+    
+    
+            var circle_marker_3f7a9fe1a77f6c2fb10fad4019a27e79 = L.circleMarker(
+                [34.27, 108.93],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 95.22, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_9583db8004160d3a103cd8fd95eaa1e6 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_7595882bf1ecf54e3262c6c9e6afe48c = $(`<div id="html_7595882bf1ecf54e3262c6c9e6afe48c" style="width: 100.0%; height: 100.0%;">         <b>西安</b><br>         人口: 476万人<br>         需求量: 4761吨<br>         仓库成本: ¥3,651,544.0         </div>`)[0];
+                popup_9583db8004160d3a103cd8fd95eaa1e6.setContent(html_7595882bf1ecf54e3262c6c9e6afe48c);
+            
+        
+
+        circle_marker_3f7a9fe1a77f6c2fb10fad4019a27e79.bindPopup(popup_9583db8004160d3a103cd8fd95eaa1e6)
+        ;
+
+        
+    
+    
+            var circle_marker_589fcc41f32fa1ae372e1e6976c6d832 = L.circleMarker(
+                [31.32, 120.62],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 174.26, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_df37c99950ddcf8cffe235aa203d6fa6 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_8fa83c4b5d8eb378c9e1d5a63e6db3e9 = $(`<div id="html_8fa83c4b5d8eb378c9e1d5a63e6db3e9" style="width: 100.0%; height: 100.0%;">         <b>苏州</b><br>         人口: 871万人<br>         需求量: 8713吨<br>         仓库成本: ¥3,648,079.0         </div>`)[0];
+                popup_df37c99950ddcf8cffe235aa203d6fa6.setContent(html_8fa83c4b5d8eb378c9e1d5a63e6db3e9);
+            
+        
+
+        circle_marker_589fcc41f32fa1ae372e1e6976c6d832.bindPopup(popup_df37c99950ddcf8cffe235aa203d6fa6)
+        ;
+
+        
+    
+    
+            var circle_marker_9399813adc49503f9d17caeac2d3416e = L.circleMarker(
+                [39.13, 117.2],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 129.3, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_400995b442e6cb4512a10dfa5005bcc8 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_9a769a15eda016024f82bef6858a141d = $(`<div id="html_9a769a15eda016024f82bef6858a141d" style="width: 100.0%; height: 100.0%;">         <b>天津</b><br>         人口: 646万人<br>         需求量: 6465吨<br>         仓库成本: ¥3,661,789.0         </div>`)[0];
+                popup_400995b442e6cb4512a10dfa5005bcc8.setContent(html_9a769a15eda016024f82bef6858a141d);
+            
+        
+
+        circle_marker_9399813adc49503f9d17caeac2d3416e.bindPopup(popup_400995b442e6cb4512a10dfa5005bcc8)
+        ;
+
+        
+    
+    
+            var circle_marker_05c2e22b848e8a00282ab9ea5a47a324 = L.circleMarker(
+                [32.04, 118.78],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 128.74, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_d37072164048f3c881f62886a9fc59e0 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_56dfa271081c18cad504b828d48abea1 = $(`<div id="html_56dfa271081c18cad504b828d48abea1" style="width: 100.0%; height: 100.0%;">         <b>南京</b><br>         人口: 643万人<br>         需求量: 6437吨<br>         仓库成本: ¥3,673,558.0         </div>`)[0];
+                popup_d37072164048f3c881f62886a9fc59e0.setContent(html_56dfa271081c18cad504b828d48abea1);
+            
+        
+
+        circle_marker_05c2e22b848e8a00282ab9ea5a47a324.bindPopup(popup_d37072164048f3c881f62886a9fc59e0)
+        ;
+
+        
+    
+    
+            var circle_marker_7b1e001ae7e758e5d9417387bf33b9d9 = L.circleMarker(
+                [28.2, 112.97],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 106.92, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_fe06ab6a9e4e3dfcd79c7b1e83a91eea = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_543da48ce7f747e64dadf33bc0da6659 = $(`<div id="html_543da48ce7f747e64dadf33bc0da6659" style="width: 100.0%; height: 100.0%;">         <b>长沙</b><br>         人口: 534万人<br>         需求量: 5346吨<br>         仓库成本: ¥2,637,168.0         </div>`)[0];
+                popup_fe06ab6a9e4e3dfcd79c7b1e83a91eea.setContent(html_543da48ce7f747e64dadf33bc0da6659);
+            
+        
+
+        circle_marker_7b1e001ae7e758e5d9417387bf33b9d9.bindPopup(popup_fe06ab6a9e4e3dfcd79c7b1e83a91eea)
+        ;
+
+        
+    
+    
+            var circle_marker_51c3c187c510cfffbf6936b421a44c7a = L.circleMarker(
+                [34.75, 113.62],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 108.44, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_e28a85114619eac74e8bcb801df5190a = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_aa07a9e0224eb94107733e244ac4bbf1 = $(`<div id="html_aa07a9e0224eb94107733e244ac4bbf1" style="width: 100.0%; height: 100.0%;">         <b>郑州</b><br>         人口: 542万人<br>         需求量: 5422吨<br>         仓库成本: ¥2,641,501.0         </div>`)[0];
+                popup_e28a85114619eac74e8bcb801df5190a.setContent(html_aa07a9e0224eb94107733e244ac4bbf1);
+            
+        
+
+        circle_marker_51c3c187c510cfffbf6936b421a44c7a.bindPopup(popup_e28a85114619eac74e8bcb801df5190a)
+        ;
+
+        
+    
+    
+            var circle_marker_a44e773276f939fac477c20b7f71e6ef = L.circleMarker(
+                [23.05, 113.75],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 87.34, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_cc0e18670ae0afb89822c2520804a2c2 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_f19ecb06acb2fe1b9da3a951c69284dc = $(`<div id="html_f19ecb06acb2fe1b9da3a951c69284dc" style="width: 100.0%; height: 100.0%;">         <b>东莞</b><br>         人口: 436万人<br>         需求量: 4367吨<br>         仓库成本: ¥2,646,660.0         </div>`)[0];
+                popup_cc0e18670ae0afb89822c2520804a2c2.setContent(html_f19ecb06acb2fe1b9da3a951c69284dc);
+            
+        
+
+        circle_marker_a44e773276f939fac477c20b7f71e6ef.bindPopup(popup_cc0e18670ae0afb89822c2520804a2c2)
+        ;
+
+        
+    
+    
+            var circle_marker_939269cb316dd66d088ca10f58365421 = L.circleMarker(
+                [36.07, 120.38],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 110.58, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_8b069372bc9c0d1cc1264751cf1a2094 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_a7ffa160d03db1899383058173d280e1 = $(`<div id="html_a7ffa160d03db1899383058173d280e1" style="width: 100.0%; height: 100.0%;">         <b>青岛</b><br>         人口: 552万人<br>         需求量: 5529吨<br>         仓库成本: ¥2,649,277.0         </div>`)[0];
+                popup_8b069372bc9c0d1cc1264751cf1a2094.setContent(html_a7ffa160d03db1899383058173d280e1);
+            
+        
+
+        circle_marker_939269cb316dd66d088ca10f58365421.bindPopup(popup_8b069372bc9c0d1cc1264751cf1a2094)
+        ;
+
+        
+    
+    
+            var circle_marker_3cb942f99d56170c6b48c48bc64b9bc6 = L.circleMarker(
+                [41.8, 123.43],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 62.56, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_88d9e9ceec03a53f91baf11a1c19004d = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_7681b313cfde274fd14d8c20b2729732 = $(`<div id="html_7681b313cfde274fd14d8c20b2729732" style="width: 100.0%; height: 100.0%;">         <b>沈阳</b><br>         人口: 312万人<br>         需求量: 3128吨<br>         仓库成本: ¥2,636,922.0         </div>`)[0];
+                popup_88d9e9ceec03a53f91baf11a1c19004d.setContent(html_7681b313cfde274fd14d8c20b2729732);
+            
+        
+
+        circle_marker_3cb942f99d56170c6b48c48bc64b9bc6.bindPopup(popup_88d9e9ceec03a53f91baf11a1c19004d)
+        ;
+
+        
+    
+    
+            var circle_marker_61252f0f02af483c6b142a109b73ff11 = L.circleMarker(
+                [29.88, 121.55],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 106.12, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_5ef4a40088c8d809739f46ddfc0b0532 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_8d4d0f65dd29dfa279703ef9f9f91a7e = $(`<div id="html_8d4d0f65dd29dfa279703ef9f9f91a7e" style="width: 100.0%; height: 100.0%;">         <b>宁波</b><br>         人口: 530万人<br>         需求量: 5306吨<br>         仓库成本: ¥2,636,219.0         </div>`)[0];
+                popup_5ef4a40088c8d809739f46ddfc0b0532.setContent(html_8d4d0f65dd29dfa279703ef9f9f91a7e);
+            
+        
+
+        circle_marker_61252f0f02af483c6b142a109b73ff11.bindPopup(popup_5ef4a40088c8d809739f46ddfc0b0532)
+        ;
+
+        
+    
+    
+            var circle_marker_f03c064f9725e28c1f32bbdc157e667a = L.circleMarker(
+                [25.05, 102.73],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 62.08, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_7e8726786d3584cddd7f94ef1ba28d47 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_0f18fb0209f22a7d42e7638f9a33cdeb = $(`<div id="html_0f18fb0209f22a7d42e7638f9a33cdeb" style="width: 100.0%; height: 100.0%;">         <b>昆明</b><br>         人口: 310万人<br>         需求量: 3104吨<br>         仓库成本: ¥2,648,716.0         </div>`)[0];
+                popup_7e8726786d3584cddd7f94ef1ba28d47.setContent(html_0f18fb0209f22a7d42e7638f9a33cdeb);
+            
+        
+
+        circle_marker_f03c064f9725e28c1f32bbdc157e667a.bindPopup(popup_7e8726786d3584cddd7f94ef1ba28d47)
+        ;
+
+        
+    
+    
+            var circle_marker_26b761333836576fa0088b0a09d7dc87 = L.circleMarker(
+                [31.83, 117.25],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 90.18, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_80401bbe0e5b24fc3c429758208eebb3 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_84f1ac084a4cbae4ed049f7e785f5016 = $(`<div id="html_84f1ac084a4cbae4ed049f7e785f5016" style="width: 100.0%; height: 100.0%;">         <b>合肥</b><br>         人口: 450万人<br>         需求量: 4509吨<br>         仓库成本: ¥2,627,628.0         </div>`)[0];
+                popup_80401bbe0e5b24fc3c429758208eebb3.setContent(html_84f1ac084a4cbae4ed049f7e785f5016);
+            
+        
+
+        circle_marker_26b761333836576fa0088b0a09d7dc87.bindPopup(popup_80401bbe0e5b24fc3c429758208eebb3)
+        ;
+
+        
+    
+    
+            var circle_marker_04bdf29977db6d287470259ea619083f = L.circleMarker(
+                [26.08, 119.3],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 89.52, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_beda77d8e3e57b45399cbf28ef606be2 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_3473f2f9ed94a908c7cbe59c2a1b4553 = $(`<div id="html_3473f2f9ed94a908c7cbe59c2a1b4553" style="width: 100.0%; height: 100.0%;">         <b>福州</b><br>         人口: 447万人<br>         需求量: 4476吨<br>         仓库成本: ¥2,642,746.0         </div>`)[0];
+                popup_beda77d8e3e57b45399cbf28ef606be2.setContent(html_3473f2f9ed94a908c7cbe59c2a1b4553);
+            
+        
+
+        circle_marker_04bdf29977db6d287470259ea619083f.bindPopup(popup_beda77d8e3e57b45399cbf28ef606be2)
+        ;
+
+        
+    
+    
+            var circle_marker_d5d927324f0a515cfd4927a94e790095 = L.circleMarker(
+                [38.05, 114.52],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 60.26, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_4a5902a202b50b7053911ccc7f9a0351 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_2e24b9f16dd29d7df5838212fff5d977 = $(`<div id="html_2e24b9f16dd29d7df5838212fff5d977" style="width: 100.0%; height: 100.0%;">         <b>石家庄</b><br>         人口: 301万人<br>         需求量: 3013吨<br>         仓库成本: ¥2,018,655.0         </div>`)[0];
+                popup_4a5902a202b50b7053911ccc7f9a0351.setContent(html_2e24b9f16dd29d7df5838212fff5d977);
+            
+        
+
+        circle_marker_d5d927324f0a515cfd4927a94e790095.bindPopup(popup_4a5902a202b50b7053911ccc7f9a0351)
+        ;
+
+        
+    
+    
+            var circle_marker_c48f4a7acc880744e6b910adf7dfb1d0 = L.circleMarker(
+                [45.75, 126.63],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 53.48, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_ba5f6667539e8b58690880d4a6a41fc4 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_d9874e218b4685384580637584ec0429 = $(`<div id="html_d9874e218b4685384580637584ec0429" style="width: 100.0%; height: 100.0%;">         <b>哈尔滨</b><br>         人口: 267万人<br>         需求量: 2674吨<br>         仓库成本: ¥2,028,313.0         </div>`)[0];
+                popup_ba5f6667539e8b58690880d4a6a41fc4.setContent(html_d9874e218b4685384580637584ec0429);
+            
+        
+
+        circle_marker_c48f4a7acc880744e6b910adf7dfb1d0.bindPopup(popup_ba5f6667539e8b58690880d4a6a41fc4)
+        ;
+
+        
+    
+    
+            var circle_marker_cd5b60e45d239bde57912858ad42b34e = L.circleMarker(
+                [43.9, 125.32],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 63.34, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_31ddff4c1f3ae962ef743ae580040e76 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_1d128d4c6847fc39dc21f9f408cf9af8 = $(`<div id="html_1d128d4c6847fc39dc21f9f408cf9af8" style="width: 100.0%; height: 100.0%;">         <b>长春</b><br>         人口: 316万人<br>         需求量: 3167吨<br>         仓库成本: ¥2,015,233.0         </div>`)[0];
+                popup_31ddff4c1f3ae962ef743ae580040e76.setContent(html_1d128d4c6847fc39dc21f9f408cf9af8);
+            
+        
+
+        circle_marker_cd5b60e45d239bde57912858ad42b34e.bindPopup(popup_31ddff4c1f3ae962ef743ae580040e76)
+        ;
+
+        
+    
+    
+            var circle_marker_ee6e019f679f238fd8ee868e6c6ff930 = L.circleMarker(
+                [28.68, 115.85],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 53.46, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_6d7f5ae1b1e65e375468d8bce8a2f316 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_b629b44bb996655351fb0ce1436b6b99 = $(`<div id="html_b629b44bb996655351fb0ce1436b6b99" style="width: 100.0%; height: 100.0%;">         <b>南昌</b><br>         人口: 267万人<br>         需求量: 2673吨<br>         仓库成本: ¥2,025,418.0         </div>`)[0];
+                popup_6d7f5ae1b1e65e375468d8bce8a2f316.setContent(html_b629b44bb996655351fb0ce1436b6b99);
+            
+        
+
+        circle_marker_ee6e019f679f238fd8ee868e6c6ff930.bindPopup(popup_6d7f5ae1b1e65e375468d8bce8a2f316)
+        ;
+
+        
+    
+    
+            var circle_marker_0cefb2e87e023898483f23322a51057f = L.circleMarker(
+                [26.65, 106.63],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 40.46, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_b92e0784c1d34c27e63ed94ce3fc1748 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_036145fbbe44c115bb4c5ae9c2407f99 = $(`<div id="html_036145fbbe44c115bb4c5ae9c2407f99" style="width: 100.0%; height: 100.0%;">         <b>贵阳</b><br>         人口: 202万人<br>         需求量: 2023吨<br>         仓库成本: ¥2,018,509.0         </div>`)[0];
+                popup_b92e0784c1d34c27e63ed94ce3fc1748.setContent(html_036145fbbe44c115bb4c5ae9c2407f99);
+            
+        
+
+        circle_marker_0cefb2e87e023898483f23322a51057f.bindPopup(popup_b92e0784c1d34c27e63ed94ce3fc1748)
+        ;
+
+        
+    
+    
+            var circle_marker_d74f2d2a11e83b1740512aa301544470 = L.circleMarker(
+                [37.87, 112.55],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 37.56, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_d99e262554f78eab2bd4b45ff16865cb = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_394db44d626b48988689d07622bb2904 = $(`<div id="html_394db44d626b48988689d07622bb2904" style="width: 100.0%; height: 100.0%;">         <b>太原</b><br>         人口: 187万人<br>         需求量: 1878吨<br>         仓库成本: ¥2,016,226.0         </div>`)[0];
+                popup_d99e262554f78eab2bd4b45ff16865cb.setContent(html_394db44d626b48988689d07622bb2904);
+            
+        
+
+        circle_marker_d74f2d2a11e83b1740512aa301544470.bindPopup(popup_d99e262554f78eab2bd4b45ff16865cb)
+        ;
+
+        
+    
+    
+            var circle_marker_2ea462a16b56a5c6515e72426cf1fb2c = L.circleMarker(
+                [22.82, 108.37],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 46.6, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_60fa8d3ca0e0d99916a4ace99af9becd = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_d4e44014fe2f9be611123cb6406fbe06 = $(`<div id="html_d4e44014fe2f9be611123cb6406fbe06" style="width: 100.0%; height: 100.0%;">         <b>南宁</b><br>         人口: 233万人<br>         需求量: 2330吨<br>         仓库成本: ¥2,021,132.0         </div>`)[0];
+                popup_60fa8d3ca0e0d99916a4ace99af9becd.setContent(html_d4e44014fe2f9be611123cb6406fbe06);
+            
+        
+
+        circle_marker_2ea462a16b56a5c6515e72426cf1fb2c.bindPopup(popup_60fa8d3ca0e0d99916a4ace99af9becd)
+        ;
+
+        
+    
+    
+            var circle_marker_71ce9914ad70b527bc0a217416a18d59 = L.circleMarker(
+                [36.07, 103.82],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 27.64, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_60389a4ce6ba2f4676ad42011694e4ff = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_ee6943c488aaae41b148a9464346c950 = $(`<div id="html_ee6943c488aaae41b148a9464346c950" style="width: 100.0%; height: 100.0%;">         <b>兰州</b><br>         人口: 138万人<br>         需求量: 1382吨<br>         仓库成本: ¥2,023,435.0         </div>`)[0];
+                popup_60389a4ce6ba2f4676ad42011694e4ff.setContent(html_ee6943c488aaae41b148a9464346c950);
+            
+        
+
+        circle_marker_71ce9914ad70b527bc0a217416a18d59.bindPopup(popup_60389a4ce6ba2f4676ad42011694e4ff)
+        ;
+
+        
+    
+    
+            var circle_marker_dff58c636e82ee5d1faf51a024fc506a = L.circleMarker(
+                [20.03, 110.32],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 17.12, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_ca497e378a26a7cea2197a7c172c0c9f = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_12e43207f67fb6d1da0cec522b488849 = $(`<div id="html_12e43207f67fb6d1da0cec522b488849" style="width: 100.0%; height: 100.0%;">         <b>海口</b><br>         人口: 85万人<br>         需求量: 856吨<br>         仓库成本: ¥2,023,724.0         </div>`)[0];
+                popup_ca497e378a26a7cea2197a7c172c0c9f.setContent(html_12e43207f67fb6d1da0cec522b488849);
+            
+        
+
+        circle_marker_dff58c636e82ee5d1faf51a024fc506a.bindPopup(popup_ca497e378a26a7cea2197a7c172c0c9f)
+        ;
+
+        
+    
+    
+            var circle_marker_3993c72cb7c4e8f82147faed226e899d = L.circleMarker(
+                [38.47, 106.28],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 17.92, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_201987d1a0eef6fbe496188132f23b8f = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_8673da048d35a0976ab00edc29db3fd3 = $(`<div id="html_8673da048d35a0976ab00edc29db3fd3" style="width: 100.0%; height: 100.0%;">         <b>银川</b><br>         人口: 89万人<br>         需求量: 896吨<br>         仓库成本: ¥2,025,511.0         </div>`)[0];
+                popup_201987d1a0eef6fbe496188132f23b8f.setContent(html_8673da048d35a0976ab00edc29db3fd3);
+            
+        
+
+        circle_marker_3993c72cb7c4e8f82147faed226e899d.bindPopup(popup_201987d1a0eef6fbe496188132f23b8f)
+        ;
+
+        
+    
+    
+            var circle_marker_45e6a8ba6008a56e7e9ee8626ad93ddc = L.circleMarker(
+                [36.62, 101.78],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 15.24, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_1190b9568677b2f556ce2e375c1f6cf3 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_39f1510b6f770408007e442878664991 = $(`<div id="html_39f1510b6f770408007e442878664991" style="width: 100.0%; height: 100.0%;">         <b>西宁</b><br>         人口: 76万人<br>         需求量: 762吨<br>         仓库成本: ¥2,026,910.0         </div>`)[0];
+                popup_1190b9568677b2f556ce2e375c1f6cf3.setContent(html_39f1510b6f770408007e442878664991);
+            
+        
+
+        circle_marker_45e6a8ba6008a56e7e9ee8626ad93ddc.bindPopup(popup_1190b9568677b2f556ce2e375c1f6cf3)
+        ;
+
+        
+    
+    
+            var circle_marker_4b15f72c72ff3cf319c538897e081392 = L.circleMarker(
+                [40.83, 111.73],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 26.16, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_54176a3a6658c3987220d6d2dbb67ee3 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_2b1b9fa8cc4f355e8f301441faeac986 = $(`<div id="html_2b1b9fa8cc4f355e8f301441faeac986" style="width: 100.0%; height: 100.0%;">         <b>呼和浩特</b><br>         人口: 130万人<br>         需求量: 1308吨<br>         仓库成本: ¥2,021,668.0         </div>`)[0];
+                popup_54176a3a6658c3987220d6d2dbb67ee3.setContent(html_2b1b9fa8cc4f355e8f301441faeac986);
+            
+        
+
+        circle_marker_4b15f72c72ff3cf319c538897e081392.bindPopup(popup_54176a3a6658c3987220d6d2dbb67ee3)
+        ;
+
+        
+    
+    
+            var circle_marker_5274fc93b83cc668c1c9b196314117ac = L.circleMarker(
+                [29.65, 91.13],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 5.76, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_f473cf9093061995269d11d084db439d = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_f4d120491ddd305282c0de5c39134bc9 = $(`<div id="html_f4d120491ddd305282c0de5c39134bc9" style="width: 100.0%; height: 100.0%;">         <b>拉萨</b><br>         人口: 28万人<br>         需求量: 288吨<br>         仓库成本: ¥2,014,248.0         </div>`)[0];
+                popup_f473cf9093061995269d11d084db439d.setContent(html_f4d120491ddd305282c0de5c39134bc9);
+            
+        
+
+        circle_marker_5274fc93b83cc668c1c9b196314117ac.bindPopup(popup_f473cf9093061995269d11d084db439d)
+        ;
+
+        
+    
+    
+            var circle_marker_494089c8d1c15972ce1630079dea68c9 = L.circleMarker(
+                [43.82, 87.62],
+                {"bubblingMouseEvents": true, "color": "#3186cc", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "#3186cc", "fillOpacity": 0.7, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 31.5, "stroke": true, "weight": 3}
+            ).addTo(marker_cluster_47479cfd93c02bee189abcc4acd679f0);
+        
+    
+        var popup_53ffbaff750105928ef3a02d7ddd5d4e = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_9e524184c396e001d9016f578856f1a5 = $(`<div id="html_9e524184c396e001d9016f578856f1a5" style="width: 100.0%; height: 100.0%;">         <b>乌鲁木齐</b><br>         人口: 157万人<br>         需求量: 1575吨<br>         仓库成本: ¥2,014,803.0         </div>`)[0];
+                popup_53ffbaff750105928ef3a02d7ddd5d4e.setContent(html_9e524184c396e001d9016f578856f1a5);
+            
+        
+
+        circle_marker_494089c8d1c15972ce1630079dea68c9.bindPopup(popup_53ffbaff750105928ef3a02d7ddd5d4e)
+        ;
+
+        
+    
+    
+            marker_cluster_47479cfd93c02bee189abcc4acd679f0.addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var marker_73933589f3ee78d77e253dd942b1ffb8 = L.marker(
+                [26.65, 106.63],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_5b07568c9453552a3b533d835c8fd868 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_e2da1bc9aaf48a979a89ffcac846f143 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_72257ed8e36f831dd6309c09de373f75 = $(`<div id="html_72257ed8e36f831dd6309c09de373f75" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 贵阳</b><br>             服务城市: 8个<br>             总成本: ¥10,759,297.711609652<br>             <button onclick="alert('服务城市: ['成都', '重庆', '昆明', '贵阳', '南宁', '海口', '拉萨', '乌鲁木齐']')">             查看详情</button>             </div>`)[0];
+                popup_e2da1bc9aaf48a979a89ffcac846f143.setContent(html_72257ed8e36f831dd6309c09de373f75);
+            
+        
+
+        marker_73933589f3ee78d77e253dd942b1ffb8.bindPopup(popup_e2da1bc9aaf48a979a89ffcac846f143)
+        ;
+
+        
+    
+    
+                marker_73933589f3ee78d77e253dd942b1ffb8.setIcon(icon_5b07568c9453552a3b533d835c8fd868);
+            
+    
+            var marker_2db3c7e045012adeba262e3d83188f7e = L.marker(
+                [36.07, 120.38],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_861ef4b2452bd85028093a1ee5aaff70 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_15a580b695f9059e98f196b5b6388f62 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_303a0dbdf47d5712423e9f9084744182 = $(`<div id="html_303a0dbdf47d5712423e9f9084744182" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 青岛</b><br>             服务城市: 4个<br>             总成本: ¥10,692,839.845482506<br>             <button onclick="alert('服务城市: ['青岛', '沈阳', '哈尔滨', '长春']')">             查看详情</button>             </div>`)[0];
+                popup_15a580b695f9059e98f196b5b6388f62.setContent(html_303a0dbdf47d5712423e9f9084744182);
+            
+        
+
+        marker_2db3c7e045012adeba262e3d83188f7e.bindPopup(popup_15a580b695f9059e98f196b5b6388f62)
+        ;
+
+        
+    
+    
+                marker_2db3c7e045012adeba262e3d83188f7e.setIcon(icon_861ef4b2452bd85028093a1ee5aaff70);
+            
+    
+            var marker_1a9905ba9df3fdf10519bfdc7c4bdde9 = L.marker(
+                [37.87, 112.55],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_ec703a6a41bc5216b369a8244f919265 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_5a4ee1de4a17c6284d4606a7625f316f = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_cb750c6f8c357217d91d79a9cebf7ee0 = $(`<div id="html_cb750c6f8c357217d91d79a9cebf7ee0" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 太原</b><br>             服务城市: 7个<br>             总成本: ¥7,086,455.004909328<br>             <button onclick="alert('服务城市: ['西安', '郑州', '太原', '兰州', '银川', '西宁', '呼和浩特']')">             查看详情</button>             </div>`)[0];
+                popup_5a4ee1de4a17c6284d4606a7625f316f.setContent(html_cb750c6f8c357217d91d79a9cebf7ee0);
+            
+        
+
+        marker_1a9905ba9df3fdf10519bfdc7c4bdde9.bindPopup(popup_5a4ee1de4a17c6284d4606a7625f316f)
+        ;
+
+        
+    
+    
+                marker_1a9905ba9df3fdf10519bfdc7c4bdde9.setIcon(icon_ec703a6a41bc5216b369a8244f919265);
+            
+    
+            var marker_2aeebfc6057e4add16f96d19555cb3fb = L.marker(
+                [38.05, 114.52],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_320d6f8b570237c0f11b755fd21247fa = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_4d77f3d08db51d18057f6f5c318f4510 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_1cd5b53d4add7b14e106332f0d6d82f2 = $(`<div id="html_1cd5b53d4add7b14e106332f0d6d82f2" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 石家庄</b><br>             服务城市: 3个<br>             总成本: ¥6,232,920.621570452<br>             <button onclick="alert('服务城市: ['北京', '天津', '石家庄']')">             查看详情</button>             </div>`)[0];
+                popup_4d77f3d08db51d18057f6f5c318f4510.setContent(html_1cd5b53d4add7b14e106332f0d6d82f2);
+            
+        
+
+        marker_2aeebfc6057e4add16f96d19555cb3fb.bindPopup(popup_4d77f3d08db51d18057f6f5c318f4510)
+        ;
+
+        
+    
+    
+                marker_2aeebfc6057e4add16f96d19555cb3fb.setIcon(icon_320d6f8b570237c0f11b755fd21247fa);
+            
+    
+            var marker_f2cef40b85238b4c2326c6d67985b562 = L.marker(
+                [28.68, 115.85],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_fa0408c28d002cc5a0b812759b367a94 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_e9f23ce5343e0a11cfa241201c38a034 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_7c402b3baacfa000567f1218780d2646 = $(`<div id="html_7c402b3baacfa000567f1218780d2646" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 南昌</b><br>             服务城市: 6个<br>             总成本: ¥17,996,151.358915057<br>             <button onclick="alert('服务城市: ['广州', '深圳', '武汉', '长沙', '东莞', '南昌']')">             查看详情</button>             </div>`)[0];
+                popup_e9f23ce5343e0a11cfa241201c38a034.setContent(html_7c402b3baacfa000567f1218780d2646);
+            
+        
+
+        marker_f2cef40b85238b4c2326c6d67985b562.bindPopup(popup_e9f23ce5343e0a11cfa241201c38a034)
+        ;
+
+        
+    
+    
+                marker_f2cef40b85238b4c2326c6d67985b562.setIcon(icon_fa0408c28d002cc5a0b812759b367a94);
+            
+    
+            var marker_237711d76fca8e266d985cafc18d4dec = L.marker(
+                [30.28, 120.15],
+                {
+}
+            ).addTo(map_35a6c8246d782babb2529a2712c6f230);
+        
+    
+            var icon_a3eccb76708ac718ddcfed7e1ce67973 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "warehouse",
+  "prefix": "fa",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_53c23ebab0503939a10710725aecd50f = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_71e0fe97bb575f538377d867af0c894f = $(`<div id="html_71e0fe97bb575f538377d867af0c894f" style="width: 100.0%; height: 100.0%;">             <b>配送中心: 杭州</b><br>             服务城市: 7个<br>             总成本: ¥13,969,200.513784919<br>             <button onclick="alert('服务城市: ['上海', '杭州', '苏州', '南京', '宁波', '合肥', '福州']')">             查看详情</button>             </div>`)[0];
+                popup_53c23ebab0503939a10710725aecd50f.setContent(html_71e0fe97bb575f538377d867af0c894f);
+            
+        
+
+        marker_237711d76fca8e266d985cafc18d4dec.bindPopup(popup_53c23ebab0503939a10710725aecd50f)
+        ;
+
+        
+    
+    
+                marker_237711d76fca8e266d985cafc18d4dec.setIcon(icon_a3eccb76708ac718ddcfed7e1ce67973);
+            
+</script>
+</html>
